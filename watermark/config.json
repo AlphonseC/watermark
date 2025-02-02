@@ -1,0 +1,12 @@
+{
+    "input_folder": "original",
+    "watermark": "Logo.png",
+    "opacity": 0.70,
+    "position": "bottom",
+    "quality": 99,
+    "scale": 15,
+    "margin_vertical": 20,
+    "margin_horizontal": 15,
+    "output_folder": "output",
+    "recursive": true
+}
