@@ -3,6 +3,7 @@ import sys
 import json
 import argparse
 import gc
+import psutil  # 用於監控記憶體使用量
 from PIL import Image
 
 def adjust_opacity(watermark, opacity):
@@ -64,7 +65,6 @@ def get_position(pos_option, base_size, watermark_size, extra_bottom_scaled=0, m
         x = base_width - watermark_width - margin
         y = base_height - margin - (watermark_height - extra_bottom_scaled)
     else:
-        # 若位置選項錯誤，則預設採用 bottom
         x = (base_width - watermark_width) // 2
         y = base_height - margin - (watermark_height - extra_bottom_scaled)
     return (int(x), int(y))
@@ -86,7 +86,6 @@ class WatermarkProcessor:
     負責載入、預處理水印圖像，並根據每張原圖生成縮放後的水印。
     """
     def __init__(self, watermark_path, opacity):
-        # 讀取水印，轉換為 RGBA 並調整透明度
         self.watermark = Image.open(watermark_path).convert("RGBA")
         self.watermark = adjust_opacity(self.watermark, opacity)
     
@@ -106,22 +105,15 @@ def process_image(file_path, output_path, watermark_processor, position, scale, 
         with Image.open(file_path) as base_img:
             if base_img.mode != 'RGBA':
                 base_img = base_img.convert('RGBA')
-
-            # 判斷圖片方向：直向 (portrait) 寬 < 高；橫向 (landscape) 寬 >= 高
             margin_used = margin_vertical if base_img.width < base_img.height else margin_horizontal
-
-            # 根據每張圖片計算縮放後的水印與底部透明邊距
             scaled_wm, extra_bottom_scaled = watermark_processor.get_scaled_watermark(base_img, scale)
             pos = get_position(position, base_img.size, scaled_wm.size, extra_bottom_scaled, margin_used)
-
             layer = Image.new('RGBA', base_img.size, (0, 0, 0, 0))
             layer.paste(scaled_wm, pos, scaled_wm)
             result = Image.alpha_composite(base_img, layer)
-
             ext = os.path.splitext(file_path)[1].lower()
             if ext in ['.jpg', '.jpeg']:
                 result = result.convert('RGB')
-
             os.makedirs(os.path.dirname(output_path), exist_ok=True)
             output_path = get_available_path(output_path)
             if ext in ['.jpg', '.jpeg'] and quality is not None:
@@ -172,6 +164,14 @@ def main():
                         help="輸出資料夾，預設為 output")
     parser.add_argument("--recursive", "-r", action="store_true", default=False,
                         help="是否遞迴處理子資料夾中的圖片，預設為不處理")
+    # 每處理圖片張數檢查一次 gc，預設 20 張
+    parser.add_argument("--gc-batch-size", type=int, default=20,
+                        help="每處理多少張圖片後進行垃圾回收檢查，預設 20 張")
+    parser.add_argument("--gc-memory-threshold", type=int, default=500,
+                        help="記憶體使用量超過此門檻值（MB）時觸發垃圾回收，預設 500 MB")
+    # 是否啟用混合模式：啟用後優先檢查記憶體使用量，再根據圖片張數作為備用
+    parser.add_argument("--enable-mixed-mode", action="store_true", default=False,
+                        help="是否啟用混合模式（預設僅依據圖片張數檢查），啟用後會先檢查記憶體使用量")
     args = parser.parse_args()
 
     # 讀取配置文件（命令列參數具有較高優先權）
@@ -190,7 +190,10 @@ def main():
                 "margin_vertical": ["--margin-vertical", "-mv"],
                 "margin_horizontal": ["--margin-horizontal", "-mh"],
                 "output_folder": ["--output-folder", "-of"],
-                "recursive": ["--recursive", "-r"]
+                "recursive": ["--recursive", "-r"],
+                "gc_batch_size": ["--gc-batch-size"],
+                "gc_memory_threshold": ["--gc-memory-threshold"],
+                "enable_mixed_mode": ["--enable-mixed-mode"]
             }
             for key, value in config_data.items():
                 if key in flag_mapping:
@@ -207,7 +210,10 @@ def main():
     # 建立 WatermarkProcessor 物件，僅載入一次水印並預處理
     watermark_processor = WatermarkProcessor(args.watermark, args.opacity)
 
-    # 使用生成器逐一處理圖片，降低記憶體負擔
+    memory_threshold_bytes = args.gc_memory_threshold * 1024 * 1024
+    gc_batch_size = args.gc_batch_size
+    image_counter = 0
+
     for file_path in iter_files(input_folder, args.recursive):
         if args.recursive:
             rel_path = os.path.relpath(os.path.dirname(file_path), input_folder)
@@ -218,9 +224,24 @@ def main():
             name, ext = os.path.splitext(os.path.basename(file_path))
             output_filename = f"{name}_mk{ext}"
             output_path = os.path.join(output_folder, output_filename)
+        
         process_image(file_path, output_path, watermark_processor, args.position,
                       args.scale, args.quality, args.margin_vertical, args.margin_horizontal)
-        gc.collect()
+        image_counter += 1
+
+        # 檢查 gc 條件
+        if args.enable_mixed_mode:
+            # 混合模式：先檢查記憶體使用量，若超過門檻則立即 gc；否則依據圖片數檢查
+            memory_used = psutil.Process(os.getpid()).memory_info().rss
+            if memory_used > memory_threshold_bytes:
+                print(f"記憶體使用量達到 {memory_used / (1024*1024):.2f} MB，觸發垃圾回收...")
+                gc.collect()
+            elif image_counter % gc_batch_size == 0:
+                gc.collect()
+        else:
+            # 僅依據圖片張數檢查
+            if image_counter % gc_batch_size == 0:
+                gc.collect()
 
 if __name__ == "__main__":
     main()
