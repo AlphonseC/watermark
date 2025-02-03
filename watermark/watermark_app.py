@@ -1,6 +1,5 @@
 import os
 import sys
-import json
 import argparse
 import gc
 import uuid
@@ -9,6 +8,7 @@ import threading
 import psutil  # 用於監控記憶體使用量
 from PIL import Image
 import concurrent.futures
+import configparser
 
 # -----------------------------
 # 自訂型別函式，用於參數驗證
@@ -76,6 +76,12 @@ def uuid_length_type(value):
         raise argparse.ArgumentTypeError("UUID 長度必須介於 4 至 36 之間")
     return ivalue
 
+def large_image_threshold_type(value):
+    ivalue = positive_int(value)
+    if ivalue < 100 or ivalue > 10000:
+        raise argparse.ArgumentTypeError("large_image_threshold 必須介於 100 至 10000 之間")
+    return ivalue
+
 def existing_file(value):
     if not os.path.isfile(value):
         raise argparse.ArgumentTypeError(f"{value} 不是一個存在的檔案")
@@ -97,6 +103,26 @@ gc_batch_size = 20         # 預設每 20 張圖片檢查一次
 image_counter = 0
 counter_lock = threading.Lock()
 stop_event = threading.Event()
+
+# -----------------------------
+# 進階記憶體管理功能：預壓縮
+# -----------------------------
+def advanced_memory_management(file_path, base_img, enable_precompression, large_image_threshold):
+    """
+    進階記憶體管理：
+    若啟用預壓縮且圖片的寬或高超過 large_image_threshold，
+    則以縮放比例調整圖片尺寸，使最大邊長等於 large_image_threshold，
+    從而降低記憶體占用。
+    """
+    if enable_precompression:
+        width, height = base_img.size
+        if width > large_image_threshold or height > large_image_threshold:
+            scale_factor = large_image_threshold / max(width, height)
+            new_width = int(width * scale_factor)
+            new_height = int(height * scale_factor)
+            print(f"預壓縮：將圖片解析度從 {width}x{height} 調整為 {new_width}x{new_height}")
+            base_img = base_img.resize((new_width, new_height), Image.Resampling.LANCZOS)
+    return base_img
 
 # -----------------------------
 # 功能函式
@@ -163,11 +189,13 @@ class WatermarkProcessor:
         extra_bottom_scaled = extra_bottom * ratio
         return resized, extra_bottom_scaled
 
-def process_image(file_path, output_path, watermark_processor, position, scale, quality, margin_vertical, margin_horizontal, enable_parallel, uuid_length):
+def process_image(file_path, output_path, watermark_processor, position, scale, quality, margin_vertical, margin_horizontal, enable_parallel, uuid_length, enable_adv_mem, enable_precompression, large_image_threshold):
     try:
         with Image.open(file_path) as base_img:
             if base_img.mode != 'RGBA':
                 base_img = base_img.convert('RGBA')
+            if enable_adv_mem:
+                base_img = advanced_memory_management(file_path, base_img, enable_precompression, large_image_threshold)
             margin_used = margin_vertical if base_img.width < base_img.height else margin_horizontal
             scaled_wm, extra_bottom_scaled = watermark_processor.get_scaled_watermark(base_img, scale)
             pos = get_position(position, base_img.size, scaled_wm.size, extra_bottom_scaled, margin_used)
@@ -186,7 +214,7 @@ def process_image(file_path, output_path, watermark_processor, position, scale, 
             print(f"處理成功：{file_path} -> {final_output_path}")
     except Exception as e:
         print(f"處理失敗 {file_path}：{e}")
-        sys.exit(1)  # 一旦出現錯誤，立即終止程式
+        sys.exit(1)
 
 def iter_files(input_folder, recursive):
     if recursive:
@@ -208,7 +236,7 @@ def memory_monitor(monitor_interval, memory_threshold_bytes):
             print(f"[監控] 記憶體使用量達到 {mem_used/(1024*1024):.2f} MB，觸發垃圾回收...")
             gc.collect()
 
-def process_single(file_path, input_folder, output_folder, watermark_processor, position, scale, quality, margin_vertical, margin_horizontal, enable_parallel, uuid_length):
+def process_single(file_path, input_folder, output_folder, watermark_processor, position, scale, quality, margin_vertical, margin_horizontal, enable_parallel, uuid_length, enable_adv_mem, enable_precompression, large_image_threshold):
     if os.path.isdir(input_folder):
         rel_path = os.path.relpath(os.path.dirname(file_path), input_folder)
         name, ext = os.path.splitext(os.path.basename(file_path))
@@ -219,7 +247,7 @@ def process_single(file_path, input_folder, output_folder, watermark_processor, 
         out_filename = f"{name}_mk{ext}"
         out_path = os.path.join(output_folder, out_filename)
     
-    process_image(file_path, out_path, watermark_processor, position, scale, quality, margin_vertical, margin_horizontal, enable_parallel, uuid_length)
+    process_image(file_path, out_path, watermark_processor, position, scale, quality, margin_vertical, margin_horizontal, enable_parallel, uuid_length, enable_adv_mem, enable_precompression, large_image_threshold)
     
     global image_counter
     with counter_lock:
@@ -260,66 +288,66 @@ def main():
                         help="是否啟用平行處理功能（預設關閉）；啟用時會在檔案名稱中加入 UUID")
     parser.add_argument("--uuid-length", type=uuid_length_type, default=6,
                         help="平行處理時輸出檔名中 UUID 的長度（4-36），預設為 6")
+    parser.add_argument("--enable-advanced-memory-management", action="store_true", default=False,
+                        help="是否啟用進階記憶體管理功能（在多線程模式下對超大圖片進行進階管理）")
+    parser.add_argument("--enable-precompression", action="store_true", default=False,
+                        help="進階記憶體管理模式下是否啟用預壓縮大型圖片，預設為關閉")
+    parser.add_argument("--large-image-threshold", type=large_image_threshold_type, default=3000,
+                        help="當圖片寬或高超過此像素值時啟用進階記憶體管理（預壓縮）的判斷，介於 100 至 10000 之間，預設為 3000")
     parser.add_argument("--config", "-c", type=str, default=None,
-                        help="配置文件 (JSON 格式)，若存在則自動讀取")
+                        help="配置文件 (INI 格式)，若存在則自動讀取")
     args = parser.parse_args()
 
     # 讀取配置文件（命令列參數具有較高優先權）
-    config_filename = args.config if args.config else "config.json"
+    config_filename = args.config if args.config else "config.ini"
     if os.path.exists(config_filename):
+        config = configparser.ConfigParser()
         try:
-            with open(config_filename, 'r', encoding='utf-8') as f:
-                config_data = json.load(f)
-            flag_mapping = {
-                "input_folder": ["--input-folder", "-if"],
-                "watermark": ["--watermark", "-w"],
-                "opacity": ["--opacity", "-o"],
-                "position": ["--position", "-p"],
-                "quality": ["--quality", "-q"],
-                "scale": ["--scale", "-s"],
-                "margin_vertical": ["--margin-vertical", "-mv"],
-                "margin_horizontal": ["--margin-horizontal", "-mh"],
-                "output_folder": ["--output-folder", "-of"],
-                "recursive": ["--recursive", "-r"],
-                "gc_batch_size": ["--gc-batch-size"],
-                "gc_memory_threshold": ["--gc-memory-threshold"],
-                "memory_check_interval": ["--memory-check-interval"],
-                "enable_mixed_mode": ["--enable-mixed-mode"],
-                "enable_parallel": ["--enable-parallel"],
-                "uuid_length": ["--uuid-length"]
-            }
-            for key, value in config_data.items():
-                if key in flag_mapping:
-                    if not any(flag in sys.argv for flag in flag_mapping[key]):
-                        setattr(args, key, value)
+            config.read(config_filename, encoding="utf-8")
+            defaults = config["DEFAULT"]
+            if not any(flag in sys.argv for flag in ["--input-folder", "-if"]):
+                args.input_folder = existing_folder(defaults.get("input_folder", "original"))
+            if not any(flag in sys.argv for flag in ["--watermark", "-w"]):
+                args.watermark = existing_file(defaults.get("watermark", "Logo.png"))
+            if not any(flag in sys.argv for flag in ["--opacity", "-o"]):
+                args.opacity = opacity_type(defaults.get("opacity", "0.65"))
+            if not any(flag in sys.argv for flag in ["--position", "-p"]):
+                args.position = defaults.get("position", "bottom")
+            if not any(flag in sys.argv for flag in ["--quality", "-q"]):
+                args.quality = quality_type(defaults.get("quality", "100"))
+            if not any(flag in sys.argv for flag in ["--scale", "-s"]):
+                args.scale = scale_type(defaults.get("scale", "15"))
+            if not any(flag in sys.argv for flag in ["--margin-vertical", "-mv"]):
+                args.margin_vertical = non_negative_int(defaults.get("margin_vertical", "20"))
+            if not any(flag in sys.argv for flag in ["--margin-horizontal", "-mh"]):
+                args.margin_horizontal = non_negative_int(defaults.get("margin_horizontal", "15"))
+            if not any(flag in sys.argv for flag in ["--output-folder", "-of"]):
+                args.output_folder = defaults.get("output_folder", "output")
+            if not any(flag in sys.argv for flag in ["--recursive", "-r"]):
+                args.recursive = defaults.getboolean("recursive", False)
+            if not any(flag in sys.argv for flag in ["--gc-batch-size"]):
+                args.gc_batch_size = positive_int(defaults.get("gc_batch_size", "20"))
+            if not any(flag in sys.argv for flag in ["--gc-memory-threshold"]):
+                args.gc_memory_threshold = positive_int(defaults.get("gc_memory_threshold", "500"))
+            if not any(flag in sys.argv for flag in ["--memory-check-interval"]):
+                args.memory_check_interval = positive_int(defaults.get("memory_check_interval", "5"))
+            if not any(flag in sys.argv for flag in ["--enable-mixed-mode"]):
+                args.enable_mixed_mode = defaults.getboolean("enable_mixed_mode", False)
+            if not any(flag in sys.argv for flag in ["--enable-parallel"]):
+                args.enable_parallel = defaults.getboolean("enable_parallel", False)
+            if not any(flag in sys.argv for flag in ["--uuid-length"]):
+                args.uuid_length = uuid_length_type(defaults.get("uuid_length", "6"))
+            if not any(flag in sys.argv for flag in ["--enable-advanced-memory-management"]):
+                args.enable_advanced_memory_management = defaults.getboolean("enable_advanced_memory_management", False)
+            if not any(flag in sys.argv for flag in ["--enable-precompression"]):
+                args.enable_precompression = defaults.getboolean("enable_precompression", False)
+            if not any(flag in sys.argv for flag in ["--large-image-threshold"]):
+                args.large_image_threshold = large_image_threshold_type(defaults.get("large_image_threshold", "3000"))
         except Exception as e:
             print(f"讀取配置文件失敗：{e}")
             sys.exit(1)
     else:
         print(f"找不到配置文件 '{config_filename}'，將使用預設值或命令列參數。")
-
-    # 印出參數摘要（確認後直接進入批量處理，不等待用戶確認）
-    params = {
-        "input_folder": args.input_folder,
-        "watermark": args.watermark,
-        "opacity": args.opacity,
-        "position": args.position,
-        "quality": args.quality,
-        "scale": args.scale,
-        "margin_vertical": args.margin_vertical,
-        "margin_horizontal": args.margin_horizontal,
-        "output_folder": args.output_folder,
-        "recursive": args.recursive,
-        "gc_batch_size": args.gc_batch_size,
-        "gc_memory_threshold": args.gc_memory_threshold,
-        "memory_check_interval": args.memory_check_interval,
-        "enable_mixed_mode": args.enable_mixed_mode,
-        "enable_parallel": args.enable_parallel,
-        "uuid_length": args.uuid_length
-    }
-    print("參數驗證通過，參數設定如下：")
-    for key, value in params.items():
-        print(f"  {key}: {value}")
 
     input_folder = args.input_folder
     output_folder = args.output_folder
@@ -357,7 +385,10 @@ def main():
                     args.margin_vertical,
                     args.margin_horizontal,
                     args.enable_parallel,
-                    uuid_length
+                    uuid_length,
+                    args.enable_advanced_memory_management,
+                    args.enable_precompression,
+                    args.large_image_threshold
                 )
                 for file_path in files
             ]
@@ -365,7 +396,9 @@ def main():
     else:
         for file_path in files:
             process_single(file_path, input_folder, output_folder, watermark_processor,
-                           args.position, args.scale, args.quality, args.margin_vertical, args.margin_horizontal, args.enable_parallel, uuid_length)
+                           args.position, args.scale, args.quality, args.margin_vertical, args.margin_horizontal,
+                           args.enable_parallel, uuid_length,
+                           args.enable_advanced_memory_management, args.enable_precompression, args.large_image_threshold)
     
     stop_event.set()
     monitor_thread.join()
