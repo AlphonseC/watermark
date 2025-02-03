@@ -1,12 +1,16 @@
 {
     "input_folder": "original",
     "watermark": "Logo.png",
-    "opacity": 0.70,
+    "opacity": 0.65,
     "position": "bottom",
-    "quality": 99,
+    "quality": 100,
     "scale": 15,
     "margin_vertical": 20,
     "margin_horizontal": 15,
     "output_folder": "output",
-    "recursive": true
-}
+    "recursive": false,
+    "gc_batch_size": 20,
+    "gc_memory_threshold": 500,
+    "enable_mixed_mode": false
+  }
+  
