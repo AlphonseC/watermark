@@ -3,8 +3,34 @@ import sys
 import json
 import argparse
 import gc
+import uuid
+import time
+import threading
 import psutil  # 用於監控記憶體使用量
 from PIL import Image
+import concurrent.futures
+
+# 全域記憶體監控與計數參數（由命令列或配置文件設定）
+MEMORY_CHECK_INTERVAL = 5  # 單位：秒，檢查間隔（預設 5 秒）
+gc_memory_threshold = 500  # 單位：MB（預設值）
+gc_batch_size = 20         # 每處理 20 張圖片進行一次 gc 檢查（預設值）
+
+# 全域計數器與鎖
+image_counter = 0
+counter_lock = threading.Lock()
+
+# 停止記憶體監控線程的事件
+stop_event = threading.Event()
+
+def get_unique_path(output_path, uuid_length=6):
+    """
+    根據指定的輸出檔案名稱，利用 UUID 產生唯一識別碼，
+    只取前 uuid_length 個字符，重新命名檔案以避免重複。
+    例如："image_mk.jpg" 轉為 "image_mk_<uuid>.jpg"
+    """
+    base, ext = os.path.splitext(output_path)
+    unique_suffix = uuid.uuid4().hex[:uuid_length]  # 取前 uuid_length 個字符
+    return f"{base}_{unique_suffix}{ext}"
 
 def adjust_opacity(watermark, opacity):
     """
@@ -42,7 +68,7 @@ def get_position(pos_option, base_size, watermark_size, extra_bottom_scaled=0, m
       - 上側：水印頂端距離圖片上邊緣為 margin 像素；
       - 底側：水印有效內容的底部（扣除縮放後透明邊距 extra_bottom_scaled）距離圖片底邊緣為 margin 像素；
       - 左右側：各保留 margin 像素距離。
-    最後將 x 與 y 座標轉為整數後回傳。
+    回傳整數座標 (x, y)。
     """
     base_width, base_height = base_size
     watermark_width, watermark_height = watermark_size
@@ -69,38 +95,27 @@ def get_position(pos_option, base_size, watermark_size, extra_bottom_scaled=0, m
         y = base_height - margin - (watermark_height - extra_bottom_scaled)
     return (int(x), int(y))
 
-def get_available_path(output_path):
-    """
-    若指定的輸出檔案已存在，自動在檔名後加入數字後綴，避免覆蓋原檔
-    """
-    base, ext = os.path.splitext(output_path)
-    counter = 1
-    new_path = output_path
-    while os.path.exists(new_path):
-        new_path = f"{base}_{counter}{ext}"
-        counter += 1
-    return new_path
-
 class WatermarkProcessor:
     """
-    負責載入、預處理水印圖像，並根據每張原圖生成縮放後的水印。
+    負責載入與預處理水印圖像，並根據每張原圖生成縮放後的水印。
     """
     def __init__(self, watermark_path, opacity):
         self.watermark = Image.open(watermark_path).convert("RGBA")
         self.watermark = adjust_opacity(self.watermark, opacity)
     
     def get_scaled_watermark(self, base_image, scale):
-        """
-        根據 base_image 與指定的縮放比例 scale，
-        傳回縮放後的水印圖像與縮放後的底部透明邊距 (extra_bottom_scaled)。
-        """
         resized, ratio = resize_watermark(self.watermark, base_image, scale)
         bbox = self.watermark.getbbox()
         extra_bottom = self.watermark.height - bbox[3] if bbox else 0
         extra_bottom_scaled = extra_bottom * ratio
         return resized, extra_bottom_scaled
 
-def process_image(file_path, output_path, watermark_processor, position, scale, quality, margin_vertical, margin_horizontal):
+def process_image(file_path, output_path, watermark_processor, position, scale, quality, margin_vertical, margin_horizontal, enable_parallel, uuid_length):
+    """
+    處理單一圖片：打開圖片、生成縮放後的水印、合成並輸出至指定路徑。
+    若平行處理啟用，則利用 get_unique_path 加入 UUID（長度由 uuid_length 決定）以避免檔名重複，
+    否則直接使用原始輸出檔名。
+    """
     try:
         with Image.open(file_path) as base_img:
             if base_img.mode != 'RGBA':
@@ -115,18 +130,19 @@ def process_image(file_path, output_path, watermark_processor, position, scale, 
             if ext in ['.jpg', '.jpeg']:
                 result = result.convert('RGB')
             os.makedirs(os.path.dirname(output_path), exist_ok=True)
-            output_path = get_available_path(output_path)
+            # 若平行處理啟用，使用 UUID 重新命名；否則直接使用原始輸出檔名
+            final_output_path = get_unique_path(output_path, uuid_length) if enable_parallel else output_path
             if ext in ['.jpg', '.jpeg'] and quality is not None:
-                result.save(output_path, quality=quality)
+                result.save(final_output_path, quality=quality)
             else:
-                result.save(output_path)
-            print(f"處理成功：{file_path} -> {output_path}")
+                result.save(final_output_path)
+            print(f"處理成功：{file_path} -> {final_output_path}")
     except Exception as e:
         print(f"處理失敗 {file_path}：{e}")
 
 def iter_files(input_folder, recursive):
     """
-    生成器：根據 input_folder 及是否遞迴處理，逐一傳回符合條件的圖片檔案路徑。
+    生成器：根據 input_folder 及是否遞迴處理，依序回傳符合條件的圖片檔案路徑。
     """
     if recursive:
         for root, _, files in os.walk(input_folder):
@@ -139,10 +155,42 @@ def iter_files(input_folder, recursive):
             if os.path.isfile(file_path) and file.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.gif')):
                 yield file_path
 
+def memory_monitor(monitor_interval, memory_threshold_bytes):
+    """
+    記憶體監控線程：每隔 monitor_interval 秒檢查一次進程記憶體使用量，
+    若超過 memory_threshold_bytes，則觸發 gc.collect()。
+    """
+    while not stop_event.is_set():
+        time.sleep(monitor_interval)
+        mem_used = psutil.Process(os.getpid()).memory_info().rss
+        if mem_used > memory_threshold_bytes:
+            print(f"[監控] 記憶體使用量達到 {mem_used/(1024*1024):.2f} MB，觸發垃圾回收...")
+            gc.collect()
+
+def process_single(file_path, input_folder, output_folder, watermark_processor, position, scale, quality, margin_vertical, margin_horizontal, enable_parallel, uuid_length):
+    """
+    處理單一圖片，根據是否啟用遞迴決定輸出路徑，並更新全域計數器（採用鎖保護）。
+    """
+    if os.path.isdir(input_folder):
+        rel_path = os.path.relpath(os.path.dirname(file_path), input_folder)
+        name, ext = os.path.splitext(os.path.basename(file_path))
+        out_filename = f"{name}_mk{ext}"
+        out_path = os.path.join(output_folder, rel_path, out_filename)
+    else:
+        name, ext = os.path.splitext(os.path.basename(file_path))
+        out_filename = f"{name}_mk{ext}"
+        out_path = os.path.join(output_folder, out_filename)
+    
+    process_image(file_path, out_path, watermark_processor, position, scale, quality, margin_vertical, margin_horizontal, enable_parallel, uuid_length)
+    
+    global image_counter
+    with counter_lock:
+        image_counter += 1
+
 def main():
     parser = argparse.ArgumentParser(description="圖片浮水印添加應用程式")
     parser.add_argument("--config", "-c", type=str, default=None,
-                        help="配置文件 (JSON 格式)，若工作目錄中存在 config.json，則自動讀取")
+                        help="配置文件 (JSON 格式)，若存在 config.json 則自動讀取")
     parser.add_argument("--input-folder", "-if", type=str, default="original",
                         help="輸入資料夾，預設為 original")
     parser.add_argument("--watermark", "-w", type=str, default="Logo.png",
@@ -164,17 +212,21 @@ def main():
                         help="輸出資料夾，預設為 output")
     parser.add_argument("--recursive", "-r", action="store_true", default=False,
                         help="是否遞迴處理子資料夾中的圖片，預設為不處理")
-    # 每處理圖片張數檢查一次 gc，預設 20 張
     parser.add_argument("--gc-batch-size", type=int, default=20,
                         help="每處理多少張圖片後進行垃圾回收檢查，預設 20 張")
     parser.add_argument("--gc-memory-threshold", type=int, default=500,
                         help="記憶體使用量超過此門檻值（MB）時觸發垃圾回收，預設 500 MB")
-    # 是否啟用混合模式：啟用後優先檢查記憶體使用量，再根據圖片張數作為備用
+    parser.add_argument("--memory-check-interval", type=int, default=5,
+                        help="記憶體監控線程檢查間隔（秒），預設 5 秒")
     parser.add_argument("--enable-mixed-mode", action="store_true", default=False,
-                        help="是否啟用混合模式（預設僅依據圖片張數檢查），啟用後會先檢查記憶體使用量")
+                        help="是否啟用混合模式（先檢查記憶體使用量，再依據圖片數量作備用檢查）")
+    parser.add_argument("--enable-parallel", action="store_true", default=False,
+                        help="是否啟用平行處理功能（預設關閉）；啟用時會在檔案名稱中加入 UUID")
+    parser.add_argument("--uuid-length", type=int, default=6,
+                        help="平行處理時輸出檔名中 UUID 的長度，預設為 6")
     args = parser.parse_args()
 
-    # 讀取配置文件（命令列參數具有較高優先權）
+    # 嘗試讀取配置文件（命令列參數具有較高優先權）
     config_filename = args.config if args.config else "config.json"
     if os.path.exists(config_filename):
         try:
@@ -193,7 +245,10 @@ def main():
                 "recursive": ["--recursive", "-r"],
                 "gc_batch_size": ["--gc-batch-size"],
                 "gc_memory_threshold": ["--gc-memory-threshold"],
-                "enable_mixed_mode": ["--enable-mixed-mode"]
+                "memory_check_interval": ["--memory-check-interval"],
+                "enable_mixed_mode": ["--enable-mixed-mode"],
+                "enable_parallel": ["--enable-parallel"],
+                "uuid_length": ["--uuid-length"]
             }
             for key, value in config_data.items():
                 if key in flag_mapping:
@@ -207,41 +262,55 @@ def main():
     input_folder = args.input_folder
     output_folder = args.output_folder
 
-    # 建立 WatermarkProcessor 物件，僅載入一次水印並預處理
+    global gc_batch_size, gc_memory_threshold
+    gc_batch_size = args.gc_batch_size
+    gc_memory_threshold = args.gc_memory_threshold  # 單位 MB
+    memory_check_interval = args.memory_check_interval
+    memory_threshold_bytes = gc_memory_threshold * 1024 * 1024
+
+    # 取得 uuid_length 參數
+    uuid_length = args.uuid_length
+
+    # 建立 WatermarkProcessor 物件
     watermark_processor = WatermarkProcessor(args.watermark, args.opacity)
 
-    memory_threshold_bytes = args.gc_memory_threshold * 1024 * 1024
-    gc_batch_size = args.gc_batch_size
-    image_counter = 0
+    # 收集所有待處理圖片路徑
+    files = list(iter_files(input_folder, args.recursive))
 
-    for file_path in iter_files(input_folder, args.recursive):
-        if args.recursive:
-            rel_path = os.path.relpath(os.path.dirname(file_path), input_folder)
-            name, ext = os.path.splitext(os.path.basename(file_path))
-            output_filename = f"{name}_mk{ext}"
-            output_path = os.path.join(output_folder, rel_path, output_filename)
-        else:
-            name, ext = os.path.splitext(os.path.basename(file_path))
-            output_filename = f"{name}_mk{ext}"
-            output_path = os.path.join(output_folder, output_filename)
-        
-        process_image(file_path, output_path, watermark_processor, args.position,
-                      args.scale, args.quality, args.margin_vertical, args.margin_horizontal)
-        image_counter += 1
+    # 啟動記憶體監控線程
+    monitor_thread = threading.Thread(target=memory_monitor, args=(memory_check_interval, memory_threshold_bytes), daemon=True)
+    monitor_thread.start()
 
-        # 檢查 gc 條件
-        if args.enable_mixed_mode:
-            # 混合模式：先檢查記憶體使用量，若超過門檻則立即 gc；否則依據圖片數檢查
-            memory_used = psutil.Process(os.getpid()).memory_info().rss
-            if memory_used > memory_threshold_bytes:
-                print(f"記憶體使用量達到 {memory_used / (1024*1024):.2f} MB，觸發垃圾回收...")
-                gc.collect()
-            elif image_counter % gc_batch_size == 0:
-                gc.collect()
-        else:
-            # 僅依據圖片張數檢查
-            if image_counter % gc_batch_size == 0:
-                gc.collect()
+    if args.enable_parallel:
+        # 使用平行處理：ThreadPoolExecutor
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            futures = [
+                executor.submit(
+                    process_single,
+                    file_path,
+                    input_folder,
+                    output_folder,
+                    watermark_processor,
+                    args.position,
+                    args.scale,
+                    args.quality,
+                    args.margin_vertical,
+                    args.margin_horizontal,
+                    args.enable_parallel,
+                    uuid_length
+                )
+                for file_path in files
+            ]
+            concurrent.futures.wait(futures)
+    else:
+        # 順序處理
+        for file_path in files:
+            process_single(file_path, input_folder, output_folder, watermark_processor,
+                           args.position, args.scale, args.quality, args.margin_vertical, args.margin_horizontal, args.enable_parallel, uuid_length)
+    
+    # 處理完畢後，停止記憶體監控線程
+    stop_event.set()
+    monitor_thread.join()
 
 if __name__ == "__main__":
     main()
