@@ -10,7 +10,53 @@ import psutil  # 用於監控記憶體使用量
 from PIL import Image
 import concurrent.futures
 
-# 全域記憶體監控與計數參數（由命令列或配置文件設定）
+# 自訂型別函式，用於參數驗證
+def positive_int(value):
+    try:
+        ivalue = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{value} 不是一個整數")
+    if ivalue <= 0:
+        raise argparse.ArgumentTypeError(f"{value} 必須是正數")
+    return ivalue
+
+def non_negative_int(value):
+    try:
+        ivalue = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{value} 不是一個整數")
+    if ivalue < 0:
+        raise argparse.ArgumentTypeError(f"{value} 不能小於 0")
+    return ivalue
+
+def positive_float(value):
+    try:
+        fvalue = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{value} 不是一個浮點數")
+    if fvalue <= 0:
+        raise argparse.ArgumentTypeError(f"{value} 必須是正數")
+    return fvalue
+
+def opacity_type(value):
+    try:
+        fvalue = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{value} 不是一個浮點數")
+    if fvalue < 0 or fvalue > 1:
+        raise argparse.ArgumentTypeError("透明度必須介於 0 與 1 之間")
+    return fvalue
+
+def quality_type(value):
+    try:
+        ivalue = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{value} 不是一個整數")
+    if ivalue < 1 or ivalue > 100:
+        raise argparse.ArgumentTypeError("品質必須介於 1 至 100 之間")
+    return ivalue
+
+# 全域記憶體監控與計數參數，將由命令列或配置文件設定
 MEMORY_CHECK_INTERVAL = 5  # 單位：秒，檢查間隔（預設 5 秒）
 gc_memory_threshold = 500  # 單位：MB（預設值）
 gc_batch_size = 20         # 每處理 20 張圖片進行一次 gc 檢查（預設值）
@@ -195,34 +241,34 @@ def main():
                         help="輸入資料夾，預設為 original")
     parser.add_argument("--watermark", "-w", type=str, default="Logo.png",
                         help="浮水印圖片檔案（需支援 PNG），預設為 Logo.png")
-    parser.add_argument("--opacity", "-o", type=float, default=0.65,
+    parser.add_argument("--opacity", "-o", type=opacity_type, default=0.65,
                         help="浮水印透明度（0~1），預設為 0.65")
     parser.add_argument("--position", "-p", type=str, default="bottom",
                         choices=["left_top", "top", "right_top", "left_bottom", "bottom", "right_bottom"],
                         help="浮水印位置，預設為 bottom（下方，水平置中）")
-    parser.add_argument("--quality", "-q", type=int, default=100,
-                        help="輸出圖片壓縮率（質量百分比），預設為 100（不壓縮，僅適用於 JPEG）")
-    parser.add_argument("--scale", "-s", type=float, default=15,
+    parser.add_argument("--quality", "-q", type=quality_type, default=100,
+                        help="輸出圖片壓縮率（質量百分比），預設為 100（1-100，僅適用於 JPEG）")
+    parser.add_argument("--scale", "-s", type=positive_float, default=15,
                         help="浮水印縮放比例（相對於圖片較短邊的百分比），預設為 15")
-    parser.add_argument("--margin-vertical", "-mv", type=int, default=20,
+    parser.add_argument("--margin-vertical", "-mv", type=non_negative_int, default=20,
                         help="直向照片水印與圖片邊緣的間距（像素），預設為 20")
-    parser.add_argument("--margin-horizontal", "-mh", type=int, default=15,
+    parser.add_argument("--margin-horizontal", "-mh", type=non_negative_int, default=15,
                         help="橫向照片水印與圖片邊緣的間距（像素），預設為 15")
     parser.add_argument("--output-folder", "-of", type=str, default="output",
                         help="輸出資料夾，預設為 output")
     parser.add_argument("--recursive", "-r", action="store_true", default=False,
                         help="是否遞迴處理子資料夾中的圖片，預設為不處理")
-    parser.add_argument("--gc-batch-size", type=int, default=20,
-                        help="每處理多少張圖片後進行垃圾回收檢查，預設 20 張")
-    parser.add_argument("--gc-memory-threshold", type=int, default=500,
-                        help="記憶體使用量超過此門檻值（MB）時觸發垃圾回收，預設 500 MB")
-    parser.add_argument("--memory-check-interval", type=int, default=5,
-                        help="記憶體監控線程檢查間隔（秒），預設 5 秒")
+    parser.add_argument("--gc-batch-size", type=positive_int, default=20,
+                        help="每處理多少張圖片後進行垃圾回收檢查，預設為 20 張")
+    parser.add_argument("--gc-memory-threshold", type=positive_int, default=500,
+                        help="記憶體使用量超過此門檻值（MB）時觸發垃圾回收，預設為 500 MB")
+    parser.add_argument("--memory-check-interval", type=positive_int, default=5,
+                        help="記憶體監控線程檢查間隔（秒），預設為 5 秒")
     parser.add_argument("--enable-mixed-mode", action="store_true", default=False,
                         help="是否啟用混合模式（先檢查記憶體使用量，再依據圖片數量作備用檢查）")
     parser.add_argument("--enable-parallel", action="store_true", default=False,
                         help="是否啟用平行處理功能（預設關閉）；啟用時會在檔案名稱中加入 UUID")
-    parser.add_argument("--uuid-length", type=int, default=6,
+    parser.add_argument("--uuid-length", type=positive_int, default=6,
                         help="平行處理時輸出檔名中 UUID 的長度，預設為 6")
     args = parser.parse_args()
 
