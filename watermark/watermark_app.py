@@ -39,7 +39,7 @@ def get_position(pos_option, base_size, watermark_size, extra_bottom_scaled=0, m
     """
     根據指定的位置與邊緣距離參數，計算水印貼上位置：
       - 上側：水印頂端距離圖片上邊緣為 margin 像素；
-      - 底側：水印有效內容的底部（扣除透明邊距 extra_bottom_scaled）距離圖片底邊緣為 margin 像素；
+      - 底側：水印有效內容的底部（扣除縮放後透明邊距 extra_bottom_scaled）距離圖片底邊緣為 margin 像素；
       - 左右側：各保留 margin 像素距離。
     最後將 x 與 y 座標轉為整數後回傳。
     """
@@ -64,13 +64,14 @@ def get_position(pos_option, base_size, watermark_size, extra_bottom_scaled=0, m
         x = base_width - watermark_width - margin
         y = base_height - margin - (watermark_height - extra_bottom_scaled)
     else:
+        # 若位置選項錯誤，則預設採用 bottom
         x = (base_width - watermark_width) // 2
         y = base_height - margin - (watermark_height - extra_bottom_scaled)
     return (int(x), int(y))
 
 def get_available_path(output_path):
     """
-    若指定的輸出檔案已存在，自動在檔名後加入數字後綴，避免覆蓋原檔。
+    若指定的輸出檔案已存在，自動在檔名後加入數字後綴，避免覆蓋原檔
     """
     base, ext = os.path.splitext(output_path)
     counter = 1
@@ -80,50 +81,60 @@ def get_available_path(output_path):
         counter += 1
     return new_path
 
-def process_image(file_path, output_path, watermark_path, opacity, position, scale, quality, margin_vertical, margin_horizontal):
+class WatermarkProcessor:
+    """
+    負責載入、預處理水印圖像，並根據每張原圖生成縮放後的水印。
+    """
+    def __init__(self, watermark_path, opacity):
+        # 讀取水印，轉換為 RGBA 並調整透明度
+        self.watermark = Image.open(watermark_path).convert("RGBA")
+        self.watermark = adjust_opacity(self.watermark, opacity)
+    
+    def get_scaled_watermark(self, base_image, scale):
+        """
+        根據 base_image 與指定的縮放比例 scale，
+        傳回縮放後的水印圖像與縮放後的底部透明邊距 (extra_bottom_scaled)。
+        """
+        resized, ratio = resize_watermark(self.watermark, base_image, scale)
+        bbox = self.watermark.getbbox()
+        extra_bottom = self.watermark.height - bbox[3] if bbox else 0
+        extra_bottom_scaled = extra_bottom * ratio
+        return resized, extra_bottom_scaled
+
+def process_image(file_path, output_path, watermark_processor, position, scale, quality, margin_vertical, margin_horizontal):
     try:
         with Image.open(file_path) as base_img:
-            # 轉換基底圖片為 RGBA 模式，確保資源在 with 區塊結束時自動關閉
             if base_img.mode != 'RGBA':
                 base_img = base_img.convert('RGBA')
 
-            # 判斷圖片方向：直向照片 (portrait) 寬 < 高；橫向照片 (landscape) 寬 >= 高
+            # 判斷圖片方向：直向 (portrait) 寬 < 高；橫向 (landscape) 寬 >= 高
             margin_used = margin_vertical if base_img.width < base_img.height else margin_horizontal
 
-            with Image.open(watermark_path) as wm:
-                if wm.mode != 'RGBA':
-                    wm = wm.convert('RGBA')
-                bbox = wm.getbbox()
-                extra_bottom = wm.height - bbox[3] if bbox else 0
+            # 根據每張圖片計算縮放後的水印與底部透明邊距
+            scaled_wm, extra_bottom_scaled = watermark_processor.get_scaled_watermark(base_img, scale)
+            pos = get_position(position, base_img.size, scaled_wm.size, extra_bottom_scaled, margin_used)
 
-                wm = adjust_opacity(wm, opacity)
-                resized_wm, ratio = resize_watermark(wm, base_img, scale)
-                extra_bottom_scaled = extra_bottom * ratio
+            layer = Image.new('RGBA', base_img.size, (0, 0, 0, 0))
+            layer.paste(scaled_wm, pos, scaled_wm)
+            result = Image.alpha_composite(base_img, layer)
 
-                pos = get_position(position, base_img.size, resized_wm.size, extra_bottom_scaled, margin_used)
+            ext = os.path.splitext(file_path)[1].lower()
+            if ext in ['.jpg', '.jpeg']:
+                result = result.convert('RGB')
 
-                # 建立全透明圖層，貼上水印，再與原圖合成
-                layer = Image.new('RGBA', base_img.size, (0, 0, 0, 0))
-                layer.paste(resized_wm, pos, resized_wm)
-                result = Image.alpha_composite(base_img, layer)
-
-                ext = os.path.splitext(file_path)[1].lower()
-                if ext in ['.jpg', '.jpeg']:
-                    result = result.convert('RGB')
-
-                os.makedirs(os.path.dirname(output_path), exist_ok=True)
-                output_path = get_available_path(output_path)
-                if ext in ['.jpg', '.jpeg'] and quality is not None:
-                    result.save(output_path, quality=quality)
-                else:
-                    result.save(output_path)
-                print(f"處理成功：{file_path} -> {output_path}")
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
+            output_path = get_available_path(output_path)
+            if ext in ['.jpg', '.jpeg'] and quality is not None:
+                result.save(output_path, quality=quality)
+            else:
+                result.save(output_path)
+            print(f"處理成功：{file_path} -> {output_path}")
     except Exception as e:
         print(f"處理失敗 {file_path}：{e}")
 
 def iter_files(input_folder, recursive):
     """
-    生成器：根據 input_folder 以及是否遞迴，逐一產生符合條件的圖片檔案路徑。
+    生成器：根據 input_folder 及是否遞迴處理，逐一傳回符合條件的圖片檔案路徑。
     """
     if recursive:
         for root, _, files in os.walk(input_folder):
@@ -193,7 +204,10 @@ def main():
     input_folder = args.input_folder
     output_folder = args.output_folder
 
-    # 使用生成器逐一處理圖片，避免一次讀入過多檔案降低記憶體負擔
+    # 建立 WatermarkProcessor 物件，僅載入一次水印並預處理
+    watermark_processor = WatermarkProcessor(args.watermark, args.opacity)
+
+    # 使用生成器逐一處理圖片，降低記憶體負擔
     for file_path in iter_files(input_folder, args.recursive):
         if args.recursive:
             rel_path = os.path.relpath(os.path.dirname(file_path), input_folder)
@@ -204,9 +218,8 @@ def main():
             name, ext = os.path.splitext(os.path.basename(file_path))
             output_filename = f"{name}_mk{ext}"
             output_path = os.path.join(output_folder, output_filename)
-        process_image(file_path, output_path, args.watermark, args.opacity, args.position,
+        process_image(file_path, output_path, watermark_processor, args.position,
                       args.scale, args.quality, args.margin_vertical, args.margin_horizontal)
-        # 強制回收垃圾，幫助釋放不再使用的資源
         gc.collect()
 
 if __name__ == "__main__":
