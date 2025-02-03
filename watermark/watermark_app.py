@@ -2,6 +2,7 @@ import os
 import sys
 import json
 import argparse
+import gc
 from PIL import Image
 
 def adjust_opacity(watermark, opacity):
@@ -37,9 +38,9 @@ def resize_watermark(watermark, base_image, scale):
 def get_position(pos_option, base_size, watermark_size, extra_bottom_scaled=0, margin=15):
     """
     根據指定的位置與邊緣距離參數，計算水印貼上位置：
-      - 上側位置：水印頂端距離圖片上邊緣為 margin 像素；
-      - 底側位置：水印有效內容的底部（扣除縮放後的透明邊距 extra_bottom_scaled）距離圖片底邊緣為 margin 像素；
-      - 左右側則分別保留 margin 像素的距離。
+      - 上側：水印頂端距離圖片上邊緣為 margin 像素；
+      - 底側：水印有效內容的底部（扣除透明邊距 extra_bottom_scaled）距離圖片底邊緣為 margin 像素；
+      - 左右側：各保留 margin 像素距離。
     最後將 x 與 y 座標轉為整數後回傳。
     """
     base_width, base_height = base_size
@@ -63,14 +64,13 @@ def get_position(pos_option, base_size, watermark_size, extra_bottom_scaled=0, m
         x = base_width - watermark_width - margin
         y = base_height - margin - (watermark_height - extra_bottom_scaled)
     else:
-        # 若位置選項錯誤，則預設採用 bottom
         x = (base_width - watermark_width) // 2
         y = base_height - margin - (watermark_height - extra_bottom_scaled)
     return (int(x), int(y))
 
 def get_available_path(output_path):
     """
-    若指定的輸出檔案已存在，自動在檔名後加入數字後綴，避免覆蓋原檔
+    若指定的輸出檔案已存在，自動在檔名後加入數字後綴，避免覆蓋原檔。
     """
     base, ext = os.path.splitext(output_path)
     counter = 1
@@ -83,7 +83,7 @@ def get_available_path(output_path):
 def process_image(file_path, output_path, watermark_path, opacity, position, scale, quality, margin_vertical, margin_horizontal):
     try:
         with Image.open(file_path) as base_img:
-            # 轉換基底圖片為 RGBA 模式
+            # 轉換基底圖片為 RGBA 模式，確保資源在 with 區塊結束時自動關閉
             if base_img.mode != 'RGBA':
                 base_img = base_img.convert('RGBA')
 
@@ -93,25 +93,20 @@ def process_image(file_path, output_path, watermark_path, opacity, position, sca
             with Image.open(watermark_path) as wm:
                 if wm.mode != 'RGBA':
                     wm = wm.convert('RGBA')
-                # 取得水印中有效內容的邊界，用以計算底部透明邊距
                 bbox = wm.getbbox()
                 extra_bottom = wm.height - bbox[3] if bbox else 0
 
-                # 調整水印透明度
                 wm = adjust_opacity(wm, opacity)
-                # 依原始水印尺寸計算縮放比例，取得縮放後的水印
                 resized_wm, ratio = resize_watermark(wm, base_img, scale)
                 extra_bottom_scaled = extra_bottom * ratio
 
-                # 計算水印貼上位置
                 pos = get_position(position, base_img.size, resized_wm.size, extra_bottom_scaled, margin_used)
 
-                # 建立全透明圖層並貼上水印，再與原圖合成
+                # 建立全透明圖層，貼上水印，再與原圖合成
                 layer = Image.new('RGBA', base_img.size, (0, 0, 0, 0))
                 layer.paste(resized_wm, pos, resized_wm)
                 result = Image.alpha_composite(base_img, layer)
 
-                # JPEG 格式需轉換為 RGB 模式
                 ext = os.path.splitext(file_path)[1].lower()
                 if ext in ['.jpg', '.jpeg']:
                     result = result.convert('RGB')
@@ -125,6 +120,21 @@ def process_image(file_path, output_path, watermark_path, opacity, position, sca
                 print(f"處理成功：{file_path} -> {output_path}")
     except Exception as e:
         print(f"處理失敗 {file_path}：{e}")
+
+def iter_files(input_folder, recursive):
+    """
+    生成器：根據 input_folder 以及是否遞迴，逐一產生符合條件的圖片檔案路徑。
+    """
+    if recursive:
+        for root, _, files in os.walk(input_folder):
+            for file in files:
+                if file.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.gif')):
+                    yield os.path.join(root, file)
+    else:
+        for file in os.listdir(input_folder):
+            file_path = os.path.join(input_folder, file)
+            if os.path.isfile(file_path) and file.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.gif')):
+                yield file_path
 
 def main():
     parser = argparse.ArgumentParser(description="圖片浮水印添加應用程式")
@@ -153,7 +163,7 @@ def main():
                         help="是否遞迴處理子資料夾中的圖片，預設為不處理")
     args = parser.parse_args()
 
-    # 讀取配置文件（命令列中明確指定的參數具有較高優先權）
+    # 讀取配置文件（命令列參數具有較高優先權）
     config_filename = args.config if args.config else "config.json"
     if os.path.exists(config_filename):
         try:
@@ -183,29 +193,21 @@ def main():
     input_folder = args.input_folder
     output_folder = args.output_folder
 
-    if args.recursive:
-        # 遞迴遍歷輸入資料夾及所有子資料夾，並在 output_folder 中維持相同結構
-        for root, _, files in os.walk(input_folder):
-            for file in files:
-                if file.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.gif')):
-                    file_path = os.path.join(root, file)
-                    rel_path = os.path.relpath(root, input_folder)
-                    name, ext = os.path.splitext(file)
-                    output_filename = f"{name}_mk{ext}"
-                    output_path = os.path.join(output_folder, rel_path, output_filename)
-                    process_image(file_path, output_path, args.watermark, args.opacity, args.position,
-                                  args.scale, args.quality, args.margin_vertical, args.margin_horizontal)
-    else:
-        # 僅處理 input_folder 頂層的圖片，不遞迴子資料夾
-        for file in os.listdir(input_folder):
-            file_path = os.path.join(input_folder, file)
-            if os.path.isfile(file_path) and file.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.gif')):
-                name, ext = os.path.splitext(file)
-                output_filename = f"{name}_mk{ext}"
-                # 在非遞迴模式下，所有輸出檔案直接存放在 output_folder 下
-                output_path = os.path.join(output_folder, output_filename)
-                process_image(file_path, output_path, args.watermark, args.opacity, args.position,
-                              args.scale, args.quality, args.margin_vertical, args.margin_horizontal)
+    # 使用生成器逐一處理圖片，避免一次讀入過多檔案降低記憶體負擔
+    for file_path in iter_files(input_folder, args.recursive):
+        if args.recursive:
+            rel_path = os.path.relpath(os.path.dirname(file_path), input_folder)
+            name, ext = os.path.splitext(os.path.basename(file_path))
+            output_filename = f"{name}_mk{ext}"
+            output_path = os.path.join(output_folder, rel_path, output_filename)
+        else:
+            name, ext = os.path.splitext(os.path.basename(file_path))
+            output_filename = f"{name}_mk{ext}"
+            output_path = os.path.join(output_folder, output_filename)
+        process_image(file_path, output_path, args.watermark, args.opacity, args.position,
+                      args.scale, args.quality, args.margin_vertical, args.margin_horizontal)
+        # 強制回收垃圾，幫助釋放不再使用的資源
+        gc.collect()
 
 if __name__ == "__main__":
     main()
