@@ -96,7 +96,7 @@
 
 ## 三、如何運行程式
 
-### 4.1 基本運行
+### 3.1 基本運行
 
 將程式碼存為 `watermark_app.py`，並確保所有待處理圖片放置於 `original` 資料夾中。若使用預設參數，直接在命令列中執行：
 
@@ -104,7 +104,7 @@
 python watermark_app.py
 ```
 
-### 4.2 指定配置文件運行
+### 3.2 指定配置文件運行
 
 假設配置文件名稱為 config.json，請使用：
 
@@ -112,7 +112,7 @@ python watermark_app.py
 python watermark_app.py --config config.json
 ```
 
-### 4.3 自訂參數運行
+### 3.3 自訂參數運行
 
 您可以直接在命令列中指定參數。例如：
 
@@ -129,7 +129,7 @@ python watermark_app.py -w MyLogo.png -o 0.8 -p right_bottom -s 20 -of my_output
 - 輸出資料夾為 `my_output`
 - 啟用遞迴處理子資料夾
 
-### 4.4 混合模式 GC 運行
+### 3.4 混合模式 GC 運行
 
 若您希望啟用混合模式垃圾回收（先依據記憶體使用量，再依據圖片張數進行檢查），可在命令列中加入 `--enable-mixed-mode` 或在配置文件中將 `"enable_mixed_mode": true` 設定。
 
